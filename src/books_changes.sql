@@ -41,5 +41,5 @@ ALTER TABLE books
     DROP COLUMN edition,
     DROP COLUMN reading_status,
     ADD COLUMN cost_book DECIMAL(10, 2),
-    ADD COLUMN book_status ENUM('available', 'borrowed', 'overdue') NOT NULL DEFAULT 'available';
+    ADD COLUMN book_status ENUM('available', 'borrowed', 'overdue', "removed") NOT NULL DEFAULT 'available';
     
