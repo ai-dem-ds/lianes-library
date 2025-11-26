@@ -1,0 +1,20 @@
+pandas
+sqlalchemy
+pymysql
+cryptography
+pyarrow
+requests
+openpyxl
+lxml
+tqdm
+notebook
+jupyterlab
+matplotlib
+beautifulsoup4
+ipykernel
+streamlit
+pytest
+# Optional pip-only / extras (uncomment if needed):
+# google-api-python-client
+# google-auth
+# some-other-pip-only-package
