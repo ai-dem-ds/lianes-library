@@ -4,7 +4,7 @@ import urllib.parse
 # ==============================
 # 1. creating the path to CSV
 # ==============================
-csv_path = "/Users/jeorgecassiodesousasilva/Documents/lianes-library/lianes-library/data/books_clean_debug2.csv"
+csv_path = "/Users/kubrademirhan/lianes_library/lianes-library/data/books_clean_debug2.csv"
 
 # ==============================
 # 2. read it trating errors
@@ -24,7 +24,7 @@ books_df = pd.read_csv(
 schema = "lianes_library"
 host = "127.0.0.1"
 user = "root"
-raw_password = "Frut@!1469"
+raw_password = "kugtagt22"
 password = urllib.parse.quote_plus(raw_password)
 port = 3306
 
