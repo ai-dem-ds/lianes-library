@@ -20,6 +20,7 @@ from src.CRUD_Blueprint import (
     get_book_by_id,
     update_book_details,
     update_book_status,
+    update_missing_prices_from_web,
     # BORROWERS
     create_borrower,
     get_borrower_by_id,
@@ -355,7 +356,7 @@ if section == "books":
 
     books_action = st.radio(
         "Choose an action:",
-        ["Search books", "Create book", "Update book", "Change status", "View book by ID"],
+        ["Search books", "Create book", "Update book", "Change status", "View book by ID", "Update prices from web"],
         horizontal=True,
     )
 
@@ -462,6 +463,17 @@ if section == "books":
                     st.warning(f"No book found with ID {book_id}.")
             except Exception as e:
                 st.error(f"Error fetching book: {e}")
+
+    # --- Update prices from web ---
+    elif books_action == "Update prices from web":
+        limit = st.number_input("How many books to update now?", min_value=1, max_value=200, value=20)
+        if st.button("Update missing prices using Google Books"):
+            try:
+                with st.spinner("Updating prices from Google Books..."):
+                    update_missing_prices_from_web(limit=int(limit))
+                st.success("Price update process finished. Check logs / DB.")
+            except Exception as e:
+                st.error(f"Error updating prices: {e}")
 
 
 # -----------------------------

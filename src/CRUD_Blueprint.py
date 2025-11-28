@@ -7,7 +7,8 @@ legacy helpers if necessary.
 """
 
 from typing import Any, Dict, List, Optional
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+import requests
 import pandas as pd
 from sqlalchemy import text
 
@@ -183,6 +184,167 @@ def delete_book(book_id):
 		except Exception:
 			transaction.rollback()
 			raise
+
+
+# --------------------------------------
+# Google Books price fetch & price log
+# --------------------------------------
+GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
+
+
+def fetch_book_price_google_books(isbn: str) -> Optional[Dict[str, Any]]:
+	"""
+	Fetch estimated book price using Google Books API.
+
+	Returns:
+		dict with keys: {"price": float, "currency": str, "raw": response_json}
+		or None if no price found.
+	"""
+	params = {
+		"q": f"isbn:{isbn}",
+		"maxResults": 1,
+	}
+
+	try:
+		resp = requests.get(GOOGLE_BOOKS_API_URL, params=params, timeout=10)
+		resp.raise_for_status()
+		data = resp.json()
+	except Exception as e:
+		print(f"[GoogleBooks] Error requesting data for ISBN {isbn}: {e}")
+		return None
+
+	items = data.get("items", [])
+	if not items:
+		print(f"[GoogleBooks] No items found for ISBN {isbn}")
+		return None
+
+	# pega o primeiro volume retornado
+	volume = items[0]
+	sale_info = volume.get("saleInfo", {}) or {}
+
+	# Tenta diferentes campos de preço
+	price = None
+	currency = None
+
+	# 1) listPrice (mais comum)
+	if "listPrice" in sale_info:
+		price = sale_info["listPrice"].get("amount")
+		currency = sale_info["listPrice"].get("currencyCode")
+
+	# 2) retailPrice (às vezes só tem esse)
+	if price is None and "retailPrice" in sale_info:
+		price = sale_info["retailPrice"].get("amount")
+		currency = sale_info["retailPrice"].get("currencyCode")
+
+	if price is None:
+		print(f"[GoogleBooks] No price info for ISBN {isbn}")
+		return None
+
+	try:
+		price = float(price)
+	except (TypeError, ValueError):
+		print(f"[GoogleBooks] Invalid price format for ISBN {isbn}: {price}")
+		return None
+
+	return {
+		"price": price,
+		"currency": currency or "UNK",
+		"raw": data,  # se quiser inspecionar no futuro
+	}
+
+
+def update_and_log_price(book_id: int, isbn: str, source: str = "google_books") -> Optional[float]:
+	"""
+	Fetch price from Google Books and:
+	- UPDATE books.cost_book
+	- INSERT row into price_history
+
+	Returns:
+		price (float) if updated, or None if not found / error.
+	"""
+	# 1) buscar preço na web
+	result = fetch_book_price_google_books(isbn)
+	if result is None:
+		print(f"❌ No price found for ISBN {isbn} (book_id={book_id})")
+		return None
+
+	price = result["price"]
+	currency = result["currency"]
+
+	engine = get_engine()
+
+	# 2) atualizar books + inserir histórico numa transação
+	with engine.begin() as conn:
+		# UPDATE na tabela books
+		conn.execute(
+			text("""
+				UPDATE books
+				SET cost_book = :price
+				WHERE book_id = :book_id
+			"""),
+			{"price": price, "book_id": book_id},
+		)
+
+		# INSERT em price_history
+		conn.execute(
+			text("""
+				INSERT INTO price_history (book_id, isbn, price, currency, source)
+				VALUES (:book_id, :isbn, :price, :currency, :source)
+			"""),
+			{
+				"book_id": book_id,
+				"isbn": isbn,
+				"price": price,
+				"currency": currency,
+				"source": source,
+			},
+		)
+
+	print(f"✅ Updated book_id={book_id}, ISBN={isbn} → {price} {currency}")
+	return price
+
+
+def update_missing_prices_from_web(limit: int = 50):
+	"""
+	Find books with missing or zero cost_book and try to update price
+	from Google Books (with logging).
+
+	Args:
+		limit: how many books to process in one run (to avoid hitting API limits).
+	"""
+	engine = get_engine()
+
+	# seleciona livros sem preço (ou zero)
+	select_sql = text("""
+		SELECT book_id, ISBN
+		FROM books
+		WHERE (cost_book IS NULL OR cost_book = 0)
+		  AND ISBN IS NOT NULL
+		  AND ISBN <> ''
+		LIMIT :limit
+	""")
+
+	with engine.connect() as conn:
+		rows = conn.execute(select_sql, {"limit": limit}).mappings().all()
+
+	if not rows:
+		print("ℹ️ No books with missing prices found.")
+		return
+
+	print(f"🔍 Found {len(rows)} book(s) with missing prices. Updating...")
+
+	updated_count = 0
+	for row in rows:
+		book_id = row["book_id"]
+		isbn = row["ISBN"]
+		try:
+			price = update_and_log_price(book_id, isbn)
+			if price is not None:
+				updated_count += 1
+		except Exception as e:
+			print(f"⚠️ Error updating price for book_id={book_id}, ISBN={isbn}: {e}")
+
+	print(f"🎉 Done. Updated {updated_count} book(s) with new prices.")
 
 
 # ----------------
