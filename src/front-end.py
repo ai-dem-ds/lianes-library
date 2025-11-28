@@ -21,6 +21,7 @@ from src.CRUD_Blueprint import (
     update_book_details,
     update_book_status,
     update_missing_prices_from_web,
+    reprocess_with_fuzzy,
     # BORROWERS
     create_borrower,
     get_borrower_by_id,
@@ -466,11 +467,62 @@ if section == "books":
 
     # --- Update prices from web ---
     elif books_action == "Update prices from web":
+        api_key = st.text_input("Google Books API Key (optional)", type="password")
         limit = st.number_input("How many books to update now?", min_value=1, max_value=200, value=20)
+        auto_fuzzy = st.checkbox("Automatically reprocess unmatched with fuzzy matching", value=False)
+        title_thresh = st.slider("Title similarity threshold", min_value=0.0, max_value=1.0, value=0.7)
+        author_thresh = st.slider("Author similarity threshold", min_value=0.0, max_value=1.0, value=0.6)
+
         if st.button("Update missing prices using Google Books"):
             try:
                 with st.spinner("Updating prices from Google Books..."):
-                    update_missing_prices_from_web(limit=int(limit))
+                    # capture the set of candidate book_ids before update
+                    engine = get_engine()
+                    from sqlalchemy import text as _text
+                    with engine.connect() as _conn:
+                        pre_rows = _conn.execute(_text("""
+                            SELECT book_id FROM books
+                            WHERE (cost_book IS NULL OR cost_book = 0)
+                              AND (ISBN IS NULL OR ISBN <> '')
+                            LIMIT :limit
+                        """), {"limit": int(limit)}).mappings().all()
+                        pre_ids = [r.get("book_id") for r in pre_rows]
+
+                    results = update_missing_prices_from_web(limit=int(limit), api_key=api_key or None)
+
+                if results:
+                    try:
+                        df = pd.DataFrame(results)
+                        st.markdown("**Updated books**")
+                        st.dataframe(df)
+                    except Exception:
+                        st.json(results)
+                else:
+                    st.info("No books were updated by the regular pass.")
+
+                # compute unmatched from pre_ids (those that remain with missing cost_book)
+                unmatched = []
+                if pre_ids:
+                    with engine.connect() as _conn:
+                        remaining = _conn.execute(_text("SELECT book_id FROM books WHERE book_id IN :ids AND (cost_book IS NULL OR cost_book = 0)"), {"ids": tuple(pre_ids)}).mappings().all()
+                        remaining_ids = [r.get("book_id") for r in remaining]
+                        unmatched = remaining_ids
+
+                st.markdown(f"**Pre-run candidates:** {len(pre_ids)} — **Updated now:** {len(results)} — **Unmatched:** {len(unmatched)}")
+
+                # Optionally reprocess unmatched with fuzzy
+                if auto_fuzzy and unmatched:
+                    with st.spinner("Reprocessing unmatched with fuzzy matching..."):
+                        fuzzy_res = reprocess_with_fuzzy(unmatched, api_key=api_key or None, title_threshold=float(title_thresh), author_threshold=float(author_thresh))
+                    if fuzzy_res:
+                        try:
+                            st.markdown("**Fuzzy-updated books**")
+                            st.dataframe(pd.DataFrame(fuzzy_res))
+                        except Exception:
+                            st.json(fuzzy_res)
+                    else:
+                        st.info("Fuzzy reprocessing didn't update any records.")
+
                 st.success("Price update process finished. Check logs / DB.")
             except Exception as e:
                 st.error(f"Error updating prices: {e}")

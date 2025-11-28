@@ -187,164 +187,393 @@ def delete_book(book_id):
 
 
 # --------------------------------------
-# Google Books price fetch & price log
+# Google Books lookup, parsing and bulk price update
 # --------------------------------------
 GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
 
 
-def fetch_book_price_google_books(isbn: str) -> Optional[Dict[str, Any]]:
-	"""
-	Fetch estimated book price using Google Books API.
+def get_exchange_rate(from_currency: str, to_currency: str = "EUR") -> Optional[float]:
+	"""Try to fetch a live FX rate from exchangerate.host. Returns None on failure.
 
-	Returns:
-		dict with keys: {"price": float, "currency": str, "raw": response_json}
-		or None if no price found.
+	Falls back to None so caller may choose a default or skip conversion.
+	"""
+	if not from_currency:
+		return None
+	try:
+		url = "https://api.exchangerate.host/latest"
+		params = {"base": from_currency.upper(), "symbols": to_currency.upper()}
+		r = requests.get(url, params=params, timeout=6)
+		r.raise_for_status()
+		data = r.json()
+		rates = data.get("rates", {})
+		rate = rates.get(to_currency.upper())
+		if rate:
+			return float(rate)
+	except Exception as e:
+		print(f"[FX] Could not fetch FX rate {from_currency}->{to_currency}: {e}")
+	return None
+
+
+def google_books_lookup(query: str, max_results: int = 5, api_key: Optional[str] = None) -> List[Dict[str, Any]]:
+	"""Consulta Google Books usando uma query (isbn:xxx ou title/author).
+
+	Retorna lista de items (podem ser vazias).
 	"""
 	params = {
-		"q": f"isbn:{isbn}",
-		"maxResults": 1,
+		"q": query,
+		"maxResults": int(max_results),
+		"printType": "books",
+		"country": "BR",
 	}
+	if api_key is None:
+		api_key = None
+	if api_key:
+		params["key"] = api_key
 
 	try:
 		resp = requests.get(GOOGLE_BOOKS_API_URL, params=params, timeout=10)
 		resp.raise_for_status()
 		data = resp.json()
+		return data.get("items", [])
 	except Exception as e:
-		print(f"[GoogleBooks] Error requesting data for ISBN {isbn}: {e}")
-		return None
+		print(f"[GoogleBooks] API error for query '{query}': {e}")
+		return []
 
-	items = data.get("items", [])
-	if not items:
-		print(f"[GoogleBooks] No items found for ISBN {isbn}")
-		return None
 
-	# pega o primeiro volume retornado
-	volume = items[0]
-	sale_info = volume.get("saleInfo", {}) or {}
+def parse_google_item(item: Dict[str, Any]) -> Dict[str, Any]:
+	"""Extrai título, autores, isbns e preço de um item retornado pela API."""
+	info = item.get("volumeInfo", {}) or {}
+	sale = item.get("saleInfo", {}) or {}
 
-	# Tenta diferentes campos de preço
+	title = info.get("title")
+	authors = info.get("authors", []) or []
+
+	isbn10 = None
+	isbn13 = None
+	for ident in info.get("industryIdentifiers", []):
+		t = ident.get("type")
+		v = ident.get("identifier")
+		if t == "ISBN_10":
+			isbn10 = v
+		elif t == "ISBN_13":
+			isbn13 = v
+
 	price = None
 	currency = None
-
-	# 1) listPrice (mais comum)
-	if "listPrice" in sale_info:
-		price = sale_info["listPrice"].get("amount")
-		currency = sale_info["listPrice"].get("currencyCode")
-
-	# 2) retailPrice (às vezes só tem esse)
-	if price is None and "retailPrice" in sale_info:
-		price = sale_info["retailPrice"].get("amount")
-		currency = sale_info["retailPrice"].get("currencyCode")
-
-	if price is None:
-		print(f"[GoogleBooks] No price info for ISBN {isbn}")
-		return None
-
-	try:
-		price = float(price)
-	except (TypeError, ValueError):
-		print(f"[GoogleBooks] Invalid price format for ISBN {isbn}: {price}")
-		return None
+	if sale.get("saleability") == "FOR_SALE":
+		price_info = sale.get("listPrice") or {}
+		price = price_info.get("amount")
+		currency = price_info.get("currencyCode")
 
 	return {
+		"title": title,
+		"authors": authors,
+		"isbn10": isbn10,
+		"isbn13": isbn13,
 		"price": price,
-		"currency": currency or "UNK",
-		"raw": data,  # se quiser inspecionar no futuro
+		"currency": currency,
+		"sale_status": sale.get("saleability"),
+		"raw": item,
 	}
 
 
-def update_and_log_price(book_id: int, isbn: str, source: str = "google_books") -> Optional[float]:
+def _normalize_text(s: Optional[str]) -> str:
+	if not s:
+		return ""
+	import re
+
+	s = s.lower().strip()
+	s = re.sub(r"[^a-z0-9\s]", " ", s)
+	s = re.sub(r"\s+", " ", s)
+	return s
+
+
+def _author_matches(db_author: Optional[str], api_authors: List[str]) -> bool:
+	if not db_author:
+		return True
+	db_norm = _normalize_text(db_author)
+	for a in api_authors:
+		if a and db_norm in _normalize_text(a):
+			return True
+		if a and _normalize_text(a) in db_norm:
+			return True
+	return False
+
+
+def _title_matches(db_title: Optional[str], api_title: Optional[str]) -> bool:
+	if not db_title or not api_title:
+		return False
+	dbn = _normalize_text(db_title)
+	apin = _normalize_text(api_title)
+	return dbn in apin or apin in dbn
+
+
+def update_missing_prices_from_web(limit: int = 50, api_key: Optional[str] = None) -> List[Dict[str, Any]]:
 	"""
-	Fetch price from Google Books and:
-	- UPDATE books.cost_book
-	- INSERT row into price_history
+	Objetivo final: para cada livro sem preço, tentar achar preço via Google Books
+	seguindo a estratégia: ISBN -> validar título/autor -> se falhar, buscar por título+autor
 
-	Returns:
-		price (float) if updated, or None if not found / error.
-	"""
-	# 1) buscar preço na web
-	result = fetch_book_price_google_books(isbn)
-	if result is None:
-		print(f"❌ No price found for ISBN {isbn} (book_id={book_id})")
-		return None
-
-	price = result["price"]
-	currency = result["currency"]
-
-	engine = get_engine()
-
-	# 2) atualizar books + inserir histórico numa transação
-	with engine.begin() as conn:
-		# UPDATE na tabela books
-		conn.execute(
-			text("""
-				UPDATE books
-				SET cost_book = :price
-				WHERE book_id = :book_id
-			"""),
-			{"price": price, "book_id": book_id},
-		)
-
-		# INSERT em price_history
-		conn.execute(
-			text("""
-				INSERT INTO price_history (book_id, isbn, price, currency, source)
-				VALUES (:book_id, :isbn, :price, :currency, :source)
-			"""),
-			{
-				"book_id": book_id,
-				"isbn": isbn,
-				"price": price,
-				"currency": currency,
-				"source": source,
-			},
-		)
-
-	print(f"✅ Updated book_id={book_id}, ISBN={isbn} → {price} {currency}")
-	return price
-
-
-def update_missing_prices_from_web(limit: int = 50):
-	"""
-	Find books with missing or zero cost_book and try to update price
-	from Google Books (with logging).
-
-	Args:
-		limit: how many books to process in one run (to avoid hitting API limits).
+	Retorna lista de registros atualizados com detalhes.
 	"""
 	engine = get_engine()
 
-	# seleciona livros sem preço (ou zero)
 	select_sql = text("""
-		SELECT book_id, ISBN
+		SELECT book_id, ISBN, title, author, cost_book
 		FROM books
 		WHERE (cost_book IS NULL OR cost_book = 0)
-		  AND ISBN IS NOT NULL
-		  AND ISBN <> ''
+		  AND (ISBN IS NULL OR ISBN <> '')
 		LIMIT :limit
 	""")
 
 	with engine.connect() as conn:
-		rows = conn.execute(select_sql, {"limit": limit}).mappings().all()
+		rows = conn.execute(select_sql, {"limit": int(limit)}).mappings().all()
 
 	if not rows:
 		print("ℹ️ No books with missing prices found.")
-		return
+		return []
 
-	print(f"🔍 Found {len(rows)} book(s) with missing prices. Updating...")
+	updated_rows: List[Dict[str, Any]] = []
+	print(f"🔍 Found {len(rows)} book(s) with missing prices. Processing...")
 
-	updated_count = 0
 	for row in rows:
-		book_id = row["book_id"]
-		isbn = row["ISBN"]
-		try:
-			price = update_and_log_price(book_id, isbn)
-			if price is not None:
-				updated_count += 1
-		except Exception as e:
-			print(f"⚠️ Error updating price for book_id={book_id}, ISBN={isbn}: {e}")
+		book_id = row.get("book_id")
+		isbn = row.get("ISBN")
+		title = row.get("title")
+		author = row.get("author")
+		old_cost = row.get("cost_book")
+		updated = False
+		updated_info: Dict[str, Any] = {
+			"book_id": book_id,
+			"title": title,
+			"old_isbn": isbn,
+			"old_cost": old_cost,
+			"new_isbn": None,
+			"new_cost": None,
+			"currency": None,
+			"matched_by": None,
+			"updated_at": None,
+		}
 
-	print(f"🎉 Done. Updated {updated_count} book(s) with new prices.")
+		# 1) Try ISBN search if ISBN present
+		candidates = []
+		if isbn:
+			q = f"isbn:{isbn}"
+			items = google_books_lookup(q, max_results=3, api_key=api_key)
+			candidates = items or []
+
+		# parse candidates and validate title/author
+		chosen = None
+		for it in candidates:
+			parsed = parse_google_item(it)
+			if parsed.get("price") is None:
+				continue
+			if _title_matches(title, parsed.get("title")) and _author_matches(author, parsed.get("authors", [])):
+				chosen = parsed
+				updated_info["matched_by"] = "isbn"
+				break
+
+		# 2) If not chosen by ISBN, try title+author search
+		if chosen is None:
+			qparts = []
+			if title:
+				qparts.append(f"intitle:{title}")
+			if author:
+				qparts.append(f"inauthor:{author}")
+			q = "+".join(qparts) if qparts else title or author or ""
+			if q:
+				items = google_books_lookup(q, max_results=5, api_key=api_key)
+				for it in items:
+					parsed = parse_google_item(it)
+					# if parsed has an isbn and price, consider it
+					if parsed.get("price") is None:
+						continue
+					# if title matches reasonably
+					if _title_matches(title, parsed.get("title")):
+						chosen = parsed
+						updated_info["matched_by"] = "title_author"
+						break
+
+		# 3) If we found a candidate with price, apply DB updates
+		if chosen is not None:
+			new_price = chosen.get("price")
+			currency = chosen.get("currency") or "UNK"
+			new_isbn = chosen.get("isbn13") or chosen.get("isbn10")
+
+			try:
+				with engine.begin() as conn:
+					# Prepare price and currency; convert BRL -> EUR so function returns EUR values
+					price_raw = float(new_price)
+					currency_label = (currency or "").upper()
+					price_to_store = price_raw
+					# If Google Books reports BRL, convert to EUR
+					if currency_label in {"BRL", "R$"}:
+						rate = get_exchange_rate("BRL", "EUR")
+						if rate is None:
+							# fallback conservative rate if live fetch fails
+							rate = 0.18
+							print(f"[FX] Using fallback BRL->EUR rate {rate}")
+						price_to_store = round(price_raw * float(rate), 2)
+						currency_db = "€"
+					else:
+						currency_db = currency or "UNK"
+
+					with engine.begin() as conn:
+						# update cost_book (store converted price if applicable)
+						conn.execute(
+							text("""
+								UPDATE books SET cost_book = :price WHERE book_id = :book_id
+							"""),
+							{"price": float(price_to_store), "book_id": book_id},
+						)
+
+						# update ISBN if we found a valid one and it's different
+						if new_isbn and (not isbn or str(new_isbn) != str(isbn)):
+							conn.execute(text("UPDATE books SET ISBN = :new_isbn WHERE book_id = :book_id"), {"new_isbn": new_isbn, "book_id": book_id})
+							updated_info["new_isbn"] = new_isbn
+
+						# insert price_history (price in EUR when conversion applied)
+						conn.execute(
+							text("""
+								INSERT INTO price_history (book_id, isbn, price, currency, source)
+								VALUES (:book_id, :isbn, :price, :currency, :source)
+							"""),
+							{"book_id": book_id, "isbn": new_isbn or isbn, "price": float(price_to_store), "currency": currency_db, "source": "google_books"},
+						)
+
+					updated = True
+					updated_info["new_cost"] = float(price_to_store)
+					updated_info["currency"] = currency_db
+					updated_info["updated_at"] = datetime.utcnow()
+					updated_rows.append(updated_info)
+					print(f"✅ Updated book_id={book_id} (ISBN {isbn} -> {new_isbn}) price {price_to_store} {currency_db}")
+			except Exception as e:
+				print(f"⚠️ DB error updating book_id={book_id}: {e}")
+
+		else:
+			print(f"❌ No suitable Google Books match for book_id={book_id}, ISBN={isbn}, title='{title}'")
+
+	print(f"🎉 Processing finished. {len(updated_rows)} book(s) updated.")
+	return updated_rows
+
+
+def reprocess_with_fuzzy(book_ids: List[int], api_key: Optional[str] = None, title_threshold: float = 0.7, author_threshold: float = 0.6) -> List[Dict[str, Any]]:
+	"""Reprocess a specific list of `book_id`s using a more permissive fuzzy matching.
+
+	Uses difflib.SequenceMatcher to compute similarity between DB title/author and API results.
+	If a candidate has a price and meets either the title or author threshold, it will be
+	applied using the same update/insert logic as `update_missing_prices_from_web` (including
+	BRL->EUR conversion).
+	"""
+	from difflib import SequenceMatcher
+
+	engine = get_engine()
+	updated_rows: List[Dict[str, Any]] = []
+
+	for bid in book_ids:
+		# fetch book
+		book = get_book_by_id(bid)
+		if not book:
+			print(f"[Fuzzy] Book id {bid} not found; skipping.")
+			continue
+		title = book.get("title")
+		author = book.get("author")
+		isbn = book.get("ISBN")
+		old_cost = book.get("cost_book")
+
+		print(f"[Fuzzy] Processing book_id={bid} title='{title}'")
+
+		# Search by title+author first; expand queries if isbn not helpful
+		qparts = []
+		if title:
+			qparts.append(f"intitle:{title}")
+		if author:
+			qparts.append(f"inauthor:{author}")
+		q = "+".join(qparts) if qparts else title or author or isbn or ""
+		if not q:
+			print(f"[Fuzzy] No viable query for book_id={bid}; skipping.")
+			continue
+
+		items = google_books_lookup(q, max_results=10, api_key=api_key)
+		chosen = None
+		chosen_parsed = None
+
+		for it in items:
+			parsed = parse_google_item(it)
+			if parsed.get("price") is None:
+				continue
+
+			# compute normalized similarity scores
+			title_score = 0.0
+			author_score = 0.0
+			if title and parsed.get("title"):
+				a = _normalize_text(title)
+				b = _normalize_text(parsed.get("title"))
+				title_score = SequenceMatcher(None, a, b).ratio()
+			if author and parsed.get("authors"):
+				a = _normalize_text(author)
+				# compare against each api author
+				for pa in parsed.get("authors", []):
+					if not pa:
+						continue
+					s = SequenceMatcher(None, a, _normalize_text(pa)).ratio()
+					if s > author_score:
+						author_score = s
+
+			# accept if thresholds met
+			if title_score >= float(title_threshold) or author_score >= float(author_threshold):
+				chosen = parsed
+				chosen_parsed = {"title_score": title_score, "author_score": author_score}
+				print(f"[Fuzzy] Candidate accepted for book_id={bid} (title_score={title_score:.2f} author_score={author_score:.2f})")
+				break
+
+		if chosen is None:
+			print(f"[Fuzzy] No fuzzy match for book_id={bid}")
+			continue
+
+		# Apply same DB update logic (with conversion)
+		new_price = chosen.get("price")
+		currency = chosen.get("currency") or "UNK"
+		new_isbn = chosen.get("isbn13") or chosen.get("isbn10")
+
+		try:
+			price_raw = float(new_price)
+			currency_label = (currency or "").upper()
+			price_to_store = price_raw
+			if currency_label in {"BRL", "R$"}:
+				rate = get_exchange_rate("BRL", "EUR")
+				if rate is None:
+					rate = 0.18
+					print(f"[FX] Using fallback BRL->EUR rate {rate}")
+				price_to_store = round(price_raw * float(rate), 2)
+				currency_db = "€"
+			else:
+				currency_db = currency or "UNK"
+
+			with engine.begin() as conn:
+				conn.execute(text("UPDATE books SET cost_book = :price WHERE book_id = :book_id"), {"price": float(price_to_store), "book_id": bid})
+				if new_isbn and (not isbn or str(new_isbn) != str(isbn)):
+					conn.execute(text("UPDATE books SET ISBN = :new_isbn WHERE book_id = :book_id"), {"new_isbn": new_isbn, "book_id": bid})
+				conn.execute(text("INSERT INTO price_history (book_id, isbn, price, currency, source) VALUES (:book_id, :isbn, :price, :currency, :source)"), {"book_id": bid, "isbn": new_isbn or isbn, "price": float(price_to_store), "currency": currency_db, "source": "google_books"})
+
+			updated_info = {
+				"book_id": bid,
+				"title": title,
+				"old_isbn": isbn,
+				"old_cost": old_cost,
+				"new_isbn": new_isbn,
+				"new_cost": float(price_to_store),
+				"currency": currency_db,
+				"matched_by": "fuzzy_title_author",
+				"title_score": chosen_parsed.get("title_score") if chosen_parsed else None,
+				"author_score": chosen_parsed.get("author_score") if chosen_parsed else None,
+				"updated_at": datetime.utcnow(),
+			}
+			updated_rows.append(updated_info)
+			print(f"[Fuzzy] ✅ Updated book_id={bid} price {price_to_store} {currency_db}")
+		except Exception as e:
+			print(f"[Fuzzy] ⚠️ DB error updating book_id={bid}: {e}")
+
+	return updated_rows
 
 
 # ----------------
